@@ -1,0 +1,320 @@
+name: Build KernelSU-Next with SUSFS Integration (LineageOS Nothing Phone 2)
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  push:
+    branches: [lineage-22.0]
+  pull_request:
+    branches: [lineage-22.0]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create release draft'
+        required: false
+        default: false
+        type: boolean
+      variant:
+        description: 'Build variant'
+        required: false
+        default: 'stable'
+        type: choice
+        options:
+          - stable
+          - experimental
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CCACHE_COMPILERCHECK: '%compiler% -dumpmachine; %compiler% -dumpversion'
+      CCACHE_NOHASHDIR: 'true'
+      CCACHE_HARDLINK: 'true'
+      CCACHE_MAXSIZE: '2G'
+      STABLE_WILDKERNELS_COMMIT: 'f2227a36f02adf3776fc9d432734faf04787f3fa'
+      STABLE_SUSFS_COMMIT: '9c726b25707bb4b926d54375964ee586aac6cd54'
+
+    strategy:
+      matrix:
+        variant: [stable, experimental]
+
+    steps:
+      - name: Maximize Build Space
+        uses: AdityaGarg8/remove-unwanted-software@v5
+        with:
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          remove-large-packages: 'true'
+          remove-swapfile: 'true'
+          remove-cached-tools: 'false'
+
+      - name: Checkout LineageOS kernel source
+        uses: actions/checkout@v5
+        with:
+          repository: LineageOS/android_kernel_nothing_sm8475
+          ref: lineage-22.0
+
+      - name: Setup ccache
+        run: |
+          sudo apt update && sudo apt install -y ccache
+          mkdir -p ~/.ccache
+          ccache --max-size=$CCACHE_MAXSIZE
+          ccache --set-config=compression=true
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: Cache build dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ccache
+          key: ${{ runner.os }}-lineage-${{ matrix.variant }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-lineage-${{ matrix.variant }}-
+            ${{ runner.os }}-lineage-
+
+      - name: Setup build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev
+          sudo apt-get install -y clang lld llvm git gawk lz4 cpio xz-utils pahole
+          sudo apt-get install -y gcc-aarch64-linux-gnu zip unzip python3 python3-dev
+
+      - name: Clone AnyKernel3-LineageOS
+        run: |
+          echo "=== Cloning your AnyKernel3-LineageOS ==="
+          git clone https://github.com/MiguVT/AnyKernel3-LineageOS.git anykernel
+          echo "✅ AnyKernel3-LineageOS cloned successfully"
+
+      - name: Get KernelSU-Next version
+        run: |
+          BASE_VERSION=10200
+          echo "BASE_VERSION=$BASE_VERSION" >> $GITHUB_ENV
+
+      - name: Set build variant
+        run: |
+          BUILD_VARIANT="${{ github.event.inputs.variant || matrix.variant }}"
+          
+          if [ "$BUILD_VARIANT" = "stable" ]; then
+            WILDKERNELS_COMMIT="$STABLE_WILDKERNELS_COMMIT"
+            SUSFS_COMMIT="$STABLE_SUSFS_COMMIT"
+          else
+            WILDKERNELS_COMMIT="latest"
+            SUSFS_COMMIT="latest"
+          fi
+          
+          echo "WILDKERNELS_COMMIT=$WILDKERNELS_COMMIT" >> $GITHUB_ENV
+          echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> $GITHUB_ENV
+          echo "BUILD_VARIANT=$BUILD_VARIANT" >> $GITHUB_ENV
+
+      - name: Clone dependencies
+        run: |
+          # Clone WildKernels patches
+          git clone https://github.com/WildKernels/kernel_patches.git
+          cd kernel_patches
+          if [ "$WILDKERNELS_COMMIT" = "latest" ]; then
+            git checkout main || git checkout master || git checkout next
+            ACTUAL_WILDKERNELS_COMMIT=$(git rev-parse HEAD)
+          else
+            git checkout "$WILDKERNELS_COMMIT"
+            ACTUAL_WILDKERNELS_COMMIT="$WILDKERNELS_COMMIT"
+          fi
+          echo "ACTUAL_WILDKERNELS_COMMIT=$ACTUAL_WILDKERNELS_COMMIT" >> $GITHUB_ENV
+          cd ..
+
+          # Clone SUSFS
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git
+          cd susfs4ksu
+          if [ "$SUSFS_COMMIT" = "latest" ]; then
+            git checkout gki-android12-5.10
+            ACTUAL_SUSFS_COMMIT=$(git rev-parse HEAD)
+          else
+            git checkout "$SUSFS_COMMIT"
+            ACTUAL_SUSFS_COMMIT="$SUSFS_COMMIT"
+          fi
+          echo "ACTUAL_SUSFS_COMMIT=$ACTUAL_SUSFS_COMMIT" >> $GITHUB_ENV
+          cd ..
+
+      - name: Install KernelSU-Next
+        run: |
+          if [ "$BUILD_VARIANT" = "experimental" ]; then
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          else
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          fi
+
+          cd KernelSU-Next/kernel
+          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
+          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+          cd ../..
+
+      - name: Apply patches
+        run: |
+          # Apply WildKernels patches
+          patch --forward -p1 < kernel_patches/next/next_hooks.patch
+
+          # Copy SUSFS files
+          cp -r susfs4ksu/kernel_patches/fs/* fs/
+          cp -r susfs4ksu/kernel_patches/include/linux/* include/linux/
+
+          # Apply SUSFS kernel patch
+          patch --forward -p1 < susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch
+
+          # Apply SUSFS patches to KernelSU-Next
+          cd KernelSU-Next
+          cp ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./
+          patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
+
+          # Apply fix patches
+          for patch in ../kernel_patches/next/susfs_fix_patches/v1.5.9/*.patch; do
+            [ -f "$patch" ] && patch -p1 --forward --fuzz=3 < "$patch" || true
+          done
+          cd ..
+
+      - name: Configure kernel
+        run: |
+          export ARCH=arm64
+          mkdir -p out
+          
+          # Use LineageOS config
+          cp vendor/nothing/waipio_GKI.config out/.config
+
+          # Add KernelSU configs
+          echo "CONFIG_KSU=y" >> out/.config
+          scripts/config --file out/.config --enable CONFIG_KSU_LSM_SECURITY_HOOKS
+          scripts/config --file out/.config --disable CONFIG_KSU_KPROBES_HOOK
+
+          # Add SUSFS configs
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_SUS_PATH
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_SUS_MOUNT
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_SUS_KSTAT
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_TRY_UMOUNT
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_SPOOF_UNAME
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          scripts/config --file out/.config --enable CONFIG_KSU_SUSFS_OPEN_REDIRECT
+
+          # Apply config
+          make O=out ARCH=arm64 olddefconfig
+
+      - name: Update kernel version
+        run: |
+          perl -pi -e 's/-dirty//' ./scripts/setlocalversion
+          perl -0777 -pi -e 's/(.*)(echo "\$res")/$1echo "\$res-LineageOS-KSU-Next-v$ENV{KSUVER}-SUSFS-$ENV{BUILD_VARIANT}"/s' ./scripts/setlocalversion
+
+      - name: Build kernel
+        run: |
+          export ARCH=arm64
+          export CC="ccache clang"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export LLVM=1
+
+          JOBS=$(nproc)
+          [ $JOBS -gt 16 ] && JOBS=16
+
+          ccache --show-stats
+          make O=out ARCH=arm64 CC="ccache clang" LLVM=1 -j$JOBS
+          ccache --show-stats
+
+      - name: Package kernel
+        run: |
+          # Find kernel image
+          IMAGE=""
+          for img in "out/arch/arm64/boot/Image.gz-dtb" "out/arch/arm64/boot/Image-dtb" "out/arch/arm64/boot/Image.gz" "out/arch/arm64/boot/Image"; do
+            if [ -f "$img" ]; then
+              IMAGE="$img"
+              break
+            fi
+          done
+
+          if [ -z "$IMAGE" ]; then
+            echo "❌ No kernel image found!"
+            exit 1
+          fi
+
+          # Copy to AnyKernel3
+          cp "$IMAGE" anykernel/
+
+          # Create zip
+          cd anykernel
+          ZIPNAME="LineageOS-KernelSU-Next-SUSFS-$BUILD_VARIANT-$(date +%Y%m%d)"
+          zip -r9 "../$ZIPNAME.zip" ./*
+          cd ..
+
+          # Create artifacts
+          mkdir -p artifacts
+          mv "$ZIPNAME.zip" artifacts/
+          cp out/.config artifacts/kernel_config
+
+          # Generate build info
+          {
+            echo "Build: LineageOS KernelSU-Next + SUSFS"
+            echo "Version: KernelSU-Next v$KSUVER"
+            echo "Variant: $BUILD_VARIANT"
+            echo "Date: $(date)"
+            echo "Kernel: $(basename "$IMAGE")"
+          } > artifacts/build_info.txt
+
+          echo "ZIPNAME=$ZIPNAME.zip" >> $GITHUB_ENV
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineageos-kernelsu-next-susfs-${{ matrix.variant }}
+          path: artifacts/
+          retention-days: 30
+
+      - name: Create Release
+        if: github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}-${{ matrix.variant }}
+          name: LineageOS KernelSU-Next + SUSFS v${{ env.KSUVER }} (${{ matrix.variant }})
+          draft: true
+          files: artifacts/*
+          body: |
+            ## LineageOS KernelSU-Next + SUSFS Kernel
+
+            **For Nothing Phone 2 running LineageOS**
+
+            ### What's This?
+            - **LineageOS kernel** with **KernelSU-Next v${{ env.KSUVER }}** and **SUSFS** integration
+            - **Build variant**: ${{ matrix.variant == 'stable' && 'Stable (recommended for daily use)' || 'Experimental (latest features)' }}
+            - **Root hiding**: Full SUSFS support for bypassing detection
+
+            ### Installation
+            1. **Backup** your current boot image
+            2. **Flash** this kernel zip in recovery (TWRP/OrangeFox)
+            3. **Install** [KernelSU-Next Manager](https://github.com/KernelSU-Next/KernelSU-Next/releases)
+            4. **Install** [SUSFS Module](https://github.com/sidex15/susfs4ksu-module/releases) through KernelSU Manager
+
+            ### Requirements
+            - Nothing Phone 2 with unlocked bootloader
+            - LineageOS ROM
+            - Custom recovery (OrangeFox recommended)
+
+            ### Important Notes
+            - ⚠️ **SUSFS Module required** - Without it, root hiding won't work properly
+            - 💾 **Always backup** your boot partition before flashing
+            - 🔧 **LineageOS only** - This kernel is specifically built for LineageOS
+
+            ### Support
+            If you have issues, check that:
+            - You're running LineageOS (not stock Nothing OS)
+            - SUSFS module is properly installed
+            - KernelSU-Next Manager is latest version
+
+            **Build Info**: ${{ matrix.variant }} build from commit ${{ github.sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
