@@ -5,10 +5,6 @@ permissions:
   actions: write
 
 on:
-  push:
-    branches: [lineage-22.0]
-  pull_request:
-    branches: [lineage-22.0]
   workflow_dispatch:
     inputs:
       create_release:
@@ -54,7 +50,7 @@ jobs:
           remove-swapfile: 'true'
           remove-cached-tools: 'false'
 
-      - name: Checkout LineageOS kernel source
+      - name: Checkout Official LineageOS kernel source
         uses: actions/checkout@v5
         with:
           repository: LineageOS/android_kernel_nothing_sm8475
@@ -73,10 +69,10 @@ jobs:
         with:
           path: |
             ~/.ccache
-          key: ${{ runner.os }}-lineage-${{ matrix.variant }}-${{ github.sha }}
+          key: ${{ runner.os }}-lineage-official-${{ matrix.variant }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-lineage-${{ matrix.variant }}-
-            ${{ runner.os }}-lineage-
+            ${{ runner.os }}-lineage-official-${{ matrix.variant }}-
+            ${{ runner.os }}-lineage-official-
 
       - name: Setup build environment
         run: |
@@ -181,8 +177,22 @@ jobs:
           export ARCH=arm64
           mkdir -p out
           
-          # Use LineageOS config
-          cp vendor/nothing/waipio_GKI.config out/.config
+          # Use LineageOS official config (prioritize waipio_GKI.config)
+          if [ -f "vendor/nothing/waipio_GKI.config" ]; then
+            echo "Using vendor/nothing/waipio_GKI.config"
+            cp vendor/nothing/waipio_GKI.config out/.config
+          elif [ -f "arch/arm64/configs/vendor/nothing_defconfig" ]; then
+            echo "Using vendor/nothing_defconfig"
+            make O=out ARCH=arm64 vendor/nothing_defconfig
+          elif [ -f "arch/arm64/configs/gki_defconfig" ]; then
+            echo "Using gki_defconfig"
+            make O=out ARCH=arm64 gki_defconfig
+          else
+            echo "❌ No suitable defconfig found!"
+            echo "Available configs:"
+            find . -name "*defconfig" -o -name "*.config" | head -10
+            exit 1
+          fi
 
           # Add KernelSU configs
           echo "CONFIG_KSU=y" >> out/.config
@@ -227,6 +237,22 @@ jobs:
           make O=out ARCH=arm64 CC="ccache clang" LLVM=1 -j$JOBS
           ccache --show-stats
 
+      - name: Validate build
+        run: |
+          # Verify kernel image exists
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "❌ Kernel build failed!"
+            exit 1
+          fi
+          
+          # Verify KernelSU integration
+          if ! grep -q "CONFIG_KSU=y" out/.config; then
+            echo "❌ KernelSU not enabled!"
+            exit 1
+          fi
+          
+          echo "✅ Build validation passed"
+
       - name: Package kernel
         run: |
           # Find kernel image
@@ -259,7 +285,8 @@ jobs:
 
           # Generate build info
           {
-            echo "Build: LineageOS KernelSU-Next + SUSFS"
+            echo "Build: LineageOS Official KernelSU-Next + SUSFS"
+            echo "Source: LineageOS/android_kernel_nothing_sm8475"
             echo "Version: KernelSU-Next v$KSUVER"
             echo "Variant: $BUILD_VARIANT"
             echo "Date: $(date)"
@@ -271,7 +298,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lineageos-kernelsu-next-susfs-${{ matrix.variant }}
+          name: lineageos-official-kernelsu-next-susfs-${{ matrix.variant }}
           path: artifacts/
           retention-days: 30
 
@@ -280,16 +307,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.run_number }}-${{ matrix.variant }}
-          name: LineageOS KernelSU-Next + SUSFS v${{ env.KSUVER }} (${{ matrix.variant }})
+          name: LineageOS Official KernelSU-Next + SUSFS v${{ env.KSUVER }} (${{ matrix.variant }})
           draft: true
           files: artifacts/*
           body: |
-            ## LineageOS KernelSU-Next + SUSFS Kernel
+            ## LineageOS Official KernelSU-Next + SUSFS Kernel
 
             **For Nothing Phone 2 running LineageOS**
 
             ### What's This?
-            - **LineageOS kernel** with **KernelSU-Next v${{ env.KSUVER }}** and **SUSFS** integration
+            - **Official LineageOS kernel** with **KernelSU-Next v${{ env.KSUVER }}** and **SUSFS** integration
+            - **Source**: LineageOS/android_kernel_nothing_sm8475 (official repository)
             - **Build variant**: ${{ matrix.variant == 'stable' && 'Stable (recommended for daily use)' || 'Experimental (latest features)' }}
             - **Root hiding**: Full SUSFS support for bypassing detection
 
@@ -301,20 +329,20 @@ jobs:
 
             ### Requirements
             - Nothing Phone 2 with unlocked bootloader
-            - LineageOS ROM
+            - LineageOS ROM (recommended)
             - Custom recovery (OrangeFox recommended)
 
             ### Important Notes
             - ⚠️ **SUSFS Module required** - Without it, root hiding won't work properly
             - 💾 **Always backup** your boot partition before flashing
-            - 🔧 **LineageOS only** - This kernel is specifically built for LineageOS
+            - 🔧 **Official LineageOS base** - Built from official LineageOS kernel source
 
             ### Support
             If you have issues, check that:
-            - You're running LineageOS (not stock Nothing OS)
+            - You're running LineageOS ROM
             - SUSFS module is properly installed
             - KernelSU-Next Manager is latest version
 
-            **Build Info**: ${{ matrix.variant }} build from commit ${{ github.sha }}
+            **Build Info**: ${{ matrix.variant }} build from official LineageOS source
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
